@@ -9,8 +9,6 @@ cfg={};cfg.ip="192.168.4.1";cfg.netmask="255.255.255.0";cfg.gateway="192.168.4.1
 
 wifi.setmode(wifi.SOFTAP);
 
-collectgarbage();
-
 print("Soft AP should have started...");
 print("Heap:(bytes)"..node.heap());
 print("MAC:"..wifi.ap.getmac().."\r\nIP:"..wifi.ap.getip());
@@ -37,8 +35,10 @@ tcpServer=net.createServer(net.TCP, 28800);
 
 
 function escapeSequenceCheckingCallback()
-	--print("escapeSequenceCheckingCallback")
+	print("escapeSequenceCheckingCallback");
+	print(escape_sequence_started);
 	if escape_sequence_started==1 then
+		print(temp_buff);
 		if string.sub(temp_buff, 1, 3)=="***"	then 
 			-- uart.on(method, [number/end_char], [function], [run_input])
 			-- To unregister the callback, provide only the "data" parameter.
@@ -71,7 +71,8 @@ function uartToTCPForwarder(data)
 			if not tmr.alarm( 1,200,tmr.ALARM_SINGLE,escapeSequenceCheckingCallback ) then
 				print("timer could not be started. whooops");
 			else
-				print("escapeSequenceCheckingCallback registered to tmr")
+				print(escape_sequence_started);
+				print("escapeSequenceCheckingCallback registered to tmr");
 			end 
 		end
 
@@ -80,18 +81,18 @@ function uartToTCPForwarder(data)
 
 
 	else
-		-- release the flag if held previously.
-		if escape_sequence_started==1 then
-			--print("abort escape")
-			escape_sequence_started = 0;
-			-- stop timer, not required because of the clearing of above flag.
+		-- this part can be called BEFORE the timer expires, so, even though we got the escape sequence
+		-- this else will reset the escape_sequence_started flag before the timer expires.
+		-- for example, we send ***<CR><LF>, then before the callback, we will be hitting the <CR> in
+		-- this "else" part, so when the callback eventually fires, the flag is unset, so the escape sequence
+		-- will, well, escape!
+		-- so, for this case, we do an additional step: if the escape sequence has started, and we are here,
+		-- then, we will ONLY add the data to the temp_buff. When the callback fires, the data WILL be sent
+		-- out, so we don't need to worry about that. The flag is also unset by the callback accordingly.
+		if escape_sequence_started==1 then			
 			-- if we are here, then it means atleast *ONE* * is lurking around in the temp_buff.
-			-- append the current data received to temp_buff and send the whole shebang
+			-- append the current data received to temp_buff and let the escape checking callback handle it.
 			temp_buff=temp_buff..data;
-			tcpSocket:send(temp_buff);
-			-- clear temp_buff
-			temp_buff="";
-
 		else
 			--print("normal case")
 			-- this is the normal case. no escape sequence started, not an escape char now either.
@@ -110,9 +111,21 @@ function tcpToUARTForwarder(socket, payload)
 end
 
 
+
+
 -- if the server is started successfully, then setup the call back functions for uart receive and tcp socket receive.
 -- each of them forwards data to the other interface
 function onSomeoneConnectedToPort80(socket)
+
+	-- restrict the number of clients to ONE. For the next guys send them an informative 
+	-- error message and close the socket. NodeMCU does not seems to have a way for making 
+	-- the server itself stop listening(further). close() closes the server and all the
+	-- connected sockets. so this is the way to go.
+	if(tcpSocket and not(tcpSocket==socket)) then
+		socket:send("cannot accept any more clients!!!");
+		socket:close();
+		return;
+	end
 
 	tcpSocket = socket
 	Interupt_sig=0;
@@ -125,14 +138,32 @@ function onSomeoneConnectedToPort80(socket)
 	-- enable the tcp socket to uart forwarding:
 	-- net.socket:on(event, function(net.socket[, string]) ) 
 	tcpSocket:on("receive",tcpToUARTForwarder);
+	tcpSocket:on("disconnection",tcpSocketDisconnectedCallback);
 
 	-- print who connected
 	for mac,ip in pairs(wifi.ap.getclient()) do
     	print(mac,ip)
 	end
 
+	print("Heap:(bytes)"..node.heap());
+	collectgarbage();
+	print("Heap:(bytes)"..node.heap());
+
 end
 
+
+
+-- function(net.socket[, string]) callback function. 
+-- The first parameter is the socket. If event is "disconnection", the second parameter is nil.
+function tcpSocketDisconnectedCallback(socket, payload)
+	-- print(payload);
+	--socket:send("<html><h1> Hello, NodeMCU!!! </h1></html>"); -- testing.
+	-- start listening again:
+	tcpSocket = nil;
+	uart.on("data");
+	tcpServer:listen(80, onSomeoneConnectedToPort80);
+
+end
 
 
 -- net.server.listen(port,[ip],function(net.socket))
