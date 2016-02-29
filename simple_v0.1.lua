@@ -24,8 +24,10 @@ print("MAC:"..wifi.ap.getmac().."\r\nIP:"..wifi.ap.getip());
 uart.setup(0,9600,8,0,1,1);
 
 tcpSocket = nil;
-escape_sequence_started = 0;
-temp_buff="";
+escape_sequence_started_uart = 0;
+escape_sequence_started_tcp = 0;
+uart_escaped_buff="";
+tcp_escaped_buff="";
 
 -- net.createServer(type, timeout)
 -- type net.TCP or net.UDP
@@ -33,29 +35,68 @@ temp_buff="";
 tcpServer=net.createServer(net.TCP, 28800);
 
 
+function sendStringToTCPCallback(str)
+	if(tcpSocket~=nil) then 
+		tcpSocket:send(str)
+	end
+	node.output(nil)        -- un-regist the redirect output function, output goes to serial
+end
 
-function escapeSequenceCheckingCallback()
-	print("escapeSequenceCheckingCallback");
-	print(escape_sequence_started);
-	if escape_sequence_started==1 then
-		print(temp_buff);
-		if string.sub(temp_buff, 1, 3)=="***"	then 
-			-- uart.on(method, [number/end_char], [function], [run_input])
-			-- To unregister the callback, provide only the "data" parameter.
-			uart.on("data");
-			-- similarly for tcp->uart forwarder is also removed?
-			-- tcpSocket:on("receive");
-			temp_buff="";
-			Interupt_sig=0; 
-			print("back to lua");
+
+function escapeSequenceCheckingCallbackFromUART()
+
+	print("escapeSequenceCheckingCallbackFromUART");	
+	print(escape_sequence_started_uart);
+
+	if escape_sequence_started_uart==1 then
+		--print(uart_escaped_buff);
+		if string.sub(uart_escaped_buff, 1, 3)=="***"	then
+			-- this is a command to be given to the Lua Interpreter: 
+            node.input(string.sub(uart_escaped_buff, 4, -1));
+            -- the output of the command appears on the UART itself.
+
+			uart_escaped_buff="";
+            escape_sequence_started_uart = 0;
 		else
 			--print("no escape sequence till timer expiry");
 			-- no escape sequence till timer expiry. send the buffer out.
-			tcpSocket:send(temp_buff);
-			-- clear temp_buff:
-			temp_buff="";
+			tcpSocket:send(uart_escaped_buff);
+			-- clear uart_escaped_buff:
+			uart_escaped_buff="";
 			-- release flag
-			escape_sequence_started = 0;
+			escape_sequence_started_uart = 0;
+		end
+	end
+end
+
+
+function escapeSequenceCheckingCallbackFromTCP()
+
+	print("escapeSequenceCheckingCallbackFromTCP");	
+	print(escape_sequence_started_tcp);
+
+	if escape_sequence_started_tcp==1 then
+		--print(uart_escaped_buff);
+		if string.sub(tcp_escaped_buff, 1, 3)=="***" then
+			-- this is a command to be given to the Lua Interpreter:			
+			-- the output of the command is given to the UART by default.
+			-- to behave like a proper telnet, redirect the output to TCP via callback.
+			-- so, register the callback and suppress UART output first:
+			node.output(sendStringToTCPCallback, 0)   -- re-direct output to function s_ouput, 0==suppress UART output of command.
+			-- then send the "command" to the Lua Interpreter:
+            node.input(string.sub(tcp_escaped_buff, 4, -1));
+            -- the callback unregisters itself...		
+
+			tcp_escaped_buff="";
+            escape_sequence_started_tcp = 0;
+		else
+			--print("no escape sequence till timer expiry");
+			-- no escape sequence till timer expiry. send the buffer out.
+			print(tcp_escaped_buff);
+			-- clear tcp_escaped_buff:
+			tcp_escaped_buff="";
+			-- release flag
+			escape_sequence_started_tcp = 0;
 		end
 	end
 end
@@ -65,34 +106,34 @@ function uartToTCPForwarder(data)
 
 	if data=="*" then
 		--print("star received")
-		if escape_sequence_started==0 then
-			escape_sequence_started = 1;
+		if escape_sequence_started_uart==0 then
+			escape_sequence_started_uart = 1;
 			tmr.unregister(1);
-			if not tmr.alarm( 1,200,tmr.ALARM_SINGLE,escapeSequenceCheckingCallback ) then
-				print("timer could not be started. whooops");
+			if not tmr.alarm( 1,200,tmr.ALARM_SINGLE,escapeSequenceCheckingCallbackFromUART ) then
+				print("timer1 could not be started. whooops");
 			else
-				print(escape_sequence_started);
-				print("escapeSequenceCheckingCallback registered to tmr");
+				print(escape_sequence_started_uart);
+				print("escapeSequenceCheckingCallbackFromUART registered to timer1");
 			end 
 		end
 
 		-- append the escape char anyway: (this is true for * or ** or *** or greater.)
-		temp_buff=temp_buff..data;
+		uart_escaped_buff=uart_escaped_buff..data;
 
 
 	else
 		-- this part can be called BEFORE the timer expires, so, even though we got the escape sequence
-		-- this else will reset the escape_sequence_started flag before the timer expires.
+		-- this else will reset the escape_sequence_started_uart flag before the timer expires.
 		-- for example, we send ***<CR><LF>, then before the callback, we will be hitting the <CR> in
 		-- this "else" part, so when the callback eventually fires, the flag is unset, so the escape sequence
 		-- will, well, escape!
 		-- so, for this case, we do an additional step: if the escape sequence has started, and we are here,
-		-- then, we will ONLY add the data to the temp_buff. When the callback fires, the data WILL be sent
+		-- then, we will ONLY add the data to the uart_escaped_buff. When the callback fires, the data WILL be sent
 		-- out, so we don't need to worry about that. The flag is also unset by the callback accordingly.
-		if escape_sequence_started==1 then			
-			-- if we are here, then it means atleast *ONE* * is lurking around in the temp_buff.
-			-- append the current data received to temp_buff and let the escape checking callback handle it.
-			temp_buff=temp_buff..data;
+		if escape_sequence_started_uart==1 then			
+			-- if we are here, then it means atleast *ONE* * is lurking around in the uart_escaped_buff.
+			-- append the current data received to uart_escaped_buff and let the escape checking callback handle it.
+			uart_escaped_buff=uart_escaped_buff..data;
 		else
 			--print("normal case")
 			-- this is the normal case. no escape sequence started, not an escape char now either.
@@ -106,8 +147,47 @@ end
 -- function(net.socket[, string]) callback function. 
 -- The first parameter is the socket. If event is "receive", the second parameter is the received data as string.
 function tcpToUARTForwarder(socket, payload)
-	print(payload);
+	--print(payload);
 	--socket:send("<html><h1> Hello, NodeMCU!!! </h1></html>"); -- testing.
+	--if payload=="*" then
+	if string.find(payload, "*") then
+		--print("star received")
+		if escape_sequence_started_tcp==0 then
+			escape_sequence_started_tcp = 1;
+			tmr.unregister(2);
+			if not tmr.alarm( 2,200,tmr.ALARM_SINGLE,escapeSequenceCheckingCallbackFromTCP ) then
+				print("timer2 could not be started. whooops");
+			else
+				print(escape_sequence_started_tcp);
+				print("escapeSequenceCheckingCallbackFromTCP registered to timer2");
+			end 
+		end
+
+		-- append the escape char anyway: (this is true for * or ** or *** or greater.)
+		tcp_escaped_buff=tcp_escaped_buff..payload;
+
+
+	else
+		-- this part can be called BEFORE the timer expires, so, even though we got the escape sequence
+		-- this else will reset the escape_sequence_started_tcp flag before the timer expires.
+		-- for example, we send ***<CR><LF>, then before the callback, we will be hitting the <CR> in
+		-- this "else" part, so when the callback eventually fires, the flag is unset, so the escape sequence
+		-- will, well, escape!
+		-- so, for this case, we do an additional step: if the escape sequence has started, and we are here,
+		-- then, we will ONLY add the payload to the tcp_escaped_buff. When the callback fires, the payload WILL be sent
+		-- out, so we don't need to worry about that. The flag is also unset by the callback accordingly.
+		if escape_sequence_started_tcp==1 then			
+			-- if we are here, then it means atleast *ONE* * is lurking around in the tcp_escaped_buff.
+			-- append the current payload received to tcp_escaped_buff and let the escape checking callback handle it.
+			tcp_escaped_buff=tcp_escaped_buff..payload;
+		else
+			--print("normal case")
+			-- this is the normal case. no escape sequence started, not an escape char now either.
+			-- just send the payload.
+			print(payload);
+		end
+
+	end
 end
 
 
@@ -129,7 +209,7 @@ function onSomeoneConnectedToPort80(socket)
 
 	tcpSocket = socket
 	Interupt_sig=0;
-	temp_buff="";
+	uart_escaped_buff="";
 
 	-- enable the uart to tcp socket forwarding:
 	-- uart.on(method, [number/end_char], [function(data)], [run_input]) , only for "data" callback
